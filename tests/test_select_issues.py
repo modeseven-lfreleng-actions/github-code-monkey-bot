@@ -20,7 +20,12 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 github = import_module("bot_github")
 reads = import_module("issue_reads")
+repository_reads = import_module("repository_reads")
 select = import_module("select_issues")
+explicit_targets = import_module("explicit_issues")
+inputs = import_module("selection_inputs")
+revision_select = import_module("revision_select")
+choose_module = import_module("selection_choose")
 categories = import_module("issue_categories")
 
 ALL = frozenset(categories.ALL_CATEGORIES)
@@ -144,21 +149,465 @@ class ParseRepositoriesTest(unittest.TestCase):
 
     def test_mixed_separators(self) -> None:
         """Commas and whitespace both separate; empties vanish."""
-        self.assertEqual(select.parse_repositories("a, b c,,d"), ["a", "b", "c", "d"])
+        self.assertEqual(inputs.parse_repositories("a, b c,,d"), ["a", "b", "c", "d"])
 
     def test_case_folding_and_dedup(self) -> None:
         """Names fold to lower case and repeats collapse, keeping order."""
-        self.assertEqual(select.parse_repositories("Foo bar FOO Bar"), ["foo", "bar"])
+        self.assertEqual(inputs.parse_repositories("Foo bar FOO Bar"), ["foo", "bar"])
 
     def test_empty_text(self) -> None:
         """Whitespace only yields no names."""
-        self.assertEqual(select.parse_repositories("  \n "), [])
+        self.assertEqual(inputs.parse_repositories("  \n "), [])
 
     def test_rejects_bad_names(self) -> None:
         """Traversal, slashes and punctuation are refused."""
         for bad in ("..", ".", "a/b", "x y!", "a,b/c"):
             with self.subTest(bad=bad), self.assertRaises(reads.SelectionError):
-                select.parse_repositories(bad)
+                inputs.parse_repositories(bad)
+
+
+class ParseIssuesTest(unittest.TestCase):
+    """``explicit_issues.parse_issues`` reads the splitter's canonical ``owner/repo#N`` form."""
+
+    def test_order_kept_and_repeats_dropped(self) -> None:
+        """Items keep the given order; case differences are repeats."""
+        self.assertEqual(
+            explicit_targets.parse_issues(
+                "org/beta#2, Org/Alpha#1 org/alpha#1\norg/beta#3", "org"
+            ),
+            [("beta", 2), ("alpha", 1), ("beta", 3)],
+        )
+        self.assertEqual(explicit_targets.parse_issues("  ", "org"), [])
+
+    def test_rejects_other_owners_and_bad_forms(self) -> None:
+        """A stranger's issue, a bad number or an unexpected spelling fails."""
+        for text in (
+            "other/alpha#1",
+            "org/alpha#0",
+            "alpha#1",
+            "org/alpha",
+            "org/a b#1",
+        ):
+            with self.subTest(text=text), self.assertRaises(reads.SelectionError):
+                explicit_targets.parse_issues(text, "org")
+
+
+class ExplicitIssuesTest(NoSubprocessCase):
+    """Named issues skip the scan and the triage filters, not the safety ones."""
+
+    def setUp(self) -> None:
+        """Patch the reads an explicit selection performs."""
+        super().setUp()
+        repositories = {
+            "alpha": repo_meta("alpha"),
+            "beta": repo_meta("beta", archived=True),
+            "delta": repo_meta("delta"),
+        }
+        self.details: dict[tuple[str, int], dict[str, Any]] = {
+            ("org/alpha", 1): self.detail(
+                type=None, assignees=["someone"], labels=["chore"]
+            ),
+            ("org/alpha", 3): self.detail(),
+            ("org/delta", 5): self.detail(state="closed"),
+            ("org/delta", 6): self.detail(labels=["no-agent"]),
+        }
+        self.repositories = repositories
+        patch.object(
+            repository_reads, "list_repositories", return_value=repositories
+        ).start()
+        patch.object(repository_reads, "repository_meta", side_effect=self.meta).start()
+        self.search = patch.object(reads, "search_open_issues").start()
+        patch.object(reads, "issue_details", side_effect=self.lookup).start()
+        patch.object(reads, "prior_attempt", return_value=None).start()
+        patch.object(reads, "has_open_linked_pr", return_value=False).start()
+        patch.object(reads, "branch_head", return_value=SHA_A).start()
+        patch.object(reads, "filtered_comments", return_value=([], 0, False)).start()
+        patch.object(reads, "fetch_guidance", return_value=(b"g\n", SHA_B)).start()
+        patch.object(
+            reads, "bot_identity", return_value={"login": "b[bot]", "email": "e"}
+        ).start()
+        patch.object(
+            revision_select, "pull_request_for_branch", return_value=None
+        ).start()
+        self.addCleanup(patch.stopall)
+
+    @staticmethod
+    def detail(**overrides: Any) -> dict[str, Any]:
+        """An ``issue_details`` reply, with the fields a direct read adds."""
+        data: dict[str, Any] = {
+            "state": "open",
+            "title": "Title",
+            "body": "Body",
+            "labels": ["bug"],
+            "type": "Bug",
+            "assignees": [],
+            "priority": "Low",
+            "url": "https://github.com/org/x/issues/1",
+            "created_at": "2026-01-01T00:00:00Z",
+            "author_association": "MEMBER",
+        }
+        data.update(overrides)
+        return data
+
+    def meta(self, _org: str, name: str) -> dict[str, Any] | None:
+        """Serve the fixture repository metadata by lower-cased name."""
+        return self.repositories.get(name)
+
+    def lookup(self, repo: str, number: int) -> dict[str, Any]:
+        """Serve the fixture details for a known issue."""
+        return self.details[(repo, number)]
+
+    def args(self, issues: str, repositories: str = "") -> Any:
+        """The parsed arguments of an explicit run."""
+        return select.build_parser().parse_args(
+            [
+                "--org",
+                "org",
+                "--output-dir",
+                "out",
+                "--mode",
+                "pull-requests",
+                "--model",
+                "m",
+                "--guidance-repository",
+                "org/.github",
+                "--fork-orgs",
+                str(FORK_ORGS_PATH),
+                "--categories",
+                "docs",
+                "--issues",
+                issues,
+                "--repositories",
+                repositories,
+            ]
+        )
+
+    def test_named_issues_are_worked_in_order_without_triage_filters(self) -> None:
+        """No scan, no Type, label, assignee, category or one-per-repository rule."""
+        selection, _ = select.build_selection(
+            self.args(
+                "org/alpha#3,org/alpha#1,org/beta#2,org/gamma#4,org/delta#5,org/delta#6"
+            )
+        )
+        self.search.assert_not_called()
+        self.assertEqual(
+            [i["key"] for i in selection["issues"]], ["alpha-3", "alpha-1"]
+        )
+        self.assertEqual(selection["issues"][1]["type"], None)
+        self.assertEqual(selection["candidates_seen"], 6)
+        self.assertEqual(selection["skipped"]["one_per_repo"], 0)
+        self.assertEqual(selection["skipped"]["category"], 0)
+        self.assertEqual(selection["skipped"]["repository"], 2)
+        self.assertEqual(selection["skipped"]["closed"], 1)
+        self.assertEqual(selection["skipped"]["label"], 1)
+        self.assertEqual(
+            selection["explicit_issues"],
+            [
+                "org/alpha#3",
+                "org/alpha#1",
+                "org/beta#2",
+                "org/gamma#4",
+                "org/delta#5",
+                "org/delta#6",
+            ],
+        )
+        reasons = {
+            entry["issue"]: entry["reason"] for entry in selection["skipped_issues"]
+        }
+        self.assertEqual(
+            set(reasons), {"org/beta#2", "org/gamma#4", "org/delta#5", "org/delta#6"}
+        )
+        self.assertIn("archived", reasons["org/beta#2"])
+        self.assertIn("not found", reasons["org/gamma#4"])
+        self.assertIn("closed", reasons["org/delta#5"])
+        self.assertIn("no-agent", reasons["org/delta#6"])
+
+    def test_named_repositories_are_read_one_by_one(self) -> None:
+        """No organisation listing: a named run cannot hit the listing ceiling."""
+        listing = patch.object(
+            repository_reads, "list_repositories", side_effect=AssertionError("listed")
+        ).start()
+        self.repositories = {"alpha": repo_meta("alpha")}
+        selection, _ = select.build_selection(self.args("org/alpha#3,org/gamma#4"))
+        listing.assert_not_called()
+        self.assertEqual([i["key"] for i in selection["issues"]], ["alpha-3"])
+        (entry,) = selection["skipped_issues"]
+        self.assertIn("not found", entry["reason"])
+
+    def test_missing_issue_and_pull_request_number_are_skipped(self) -> None:
+        """An absent issue, or a pull request's number, skips that item alone."""
+
+        def lookup(repo: str, number: int) -> dict[str, Any]:
+            if number == 9:
+                raise github.GitHubError("gh: Not Found (HTTP 404)")
+            if number == 8:
+                raise reads.NotAnIssue(f"{repo}#{number} is a pull request")
+            return self.details[(repo, number)]
+
+        patch.object(reads, "issue_details", side_effect=lookup).start()
+        selection, _ = select.build_selection(
+            self.args("org/alpha#9,org/alpha#8,org/alpha#3")
+        )
+        self.assertEqual([i["key"] for i in selection["issues"]], ["alpha-3"])
+        reasons = {e["issue"]: e["reason"] for e in selection["skipped_issues"]}
+        self.assertIn("not found", reasons["org/alpha#9"])
+        self.assertIn("pull request", reasons["org/alpha#8"])
+
+    def test_other_read_failures_still_abort(self) -> None:
+        """A server or permission failure is not a skip."""
+        patch.object(
+            reads,
+            "issue_details",
+            side_effect=github.GitHubError("gh: Server Error (HTTP 502)"),
+        ).start()
+        with self.assertRaises(github.GitHubError):
+            select.build_selection(self.args("org/alpha#3"))
+
+    def test_empty_repository_is_a_named_skip(self) -> None:
+        """An issue in a repository with no commits skips alone; the rest proceed."""
+        self.repositories["empty"] = repo_meta("empty", default_branch=None)
+        selection, _ = select.build_selection(self.args("org/empty#1,org/alpha#3"))
+        self.assertEqual([i["key"] for i in selection["issues"]], ["alpha-3"])
+        (entry,) = selection["skipped_issues"]
+        self.assertEqual(entry["issue"], "org/empty#1")
+        self.assertIn("empty", entry["reason"])
+
+    def test_prior_attempt_is_named(self) -> None:
+        """An issue with an open bot pull request is skipped with a reason."""
+        patch.object(reads, "prior_attempt", return_value="pull_request").start()
+        selection, _ = select.build_selection(self.args("org/alpha#3"))
+        self.assertEqual(selection["issues"], [])
+        (entry,) = selection["skipped_issues"]
+        self.assertIn("pull request", entry["reason"])
+
+    def test_issues_and_repositories_exclude_each_other(self) -> None:
+        """Naming issues and repositories at once is refused."""
+        with self.assertRaises(reads.SelectionError):
+            select.build_selection(self.args("org/alpha#3", repositories="alpha"))
+
+    def test_summary_lists_skipped_issues(self) -> None:
+        """The step summary names each skipped issue and its reason."""
+        selection, _ = select.build_selection(self.args("org/gamma#4"))
+        text = outputs.summary_markdown(selection)
+        self.assertIn("org/gamma#4", text)
+        self.assertIn("not found", text)
+
+
+class RevisionIntegrationTest(NoSubprocessCase):
+    """Named pull requests, named issues with a bot PR, and the scan's revisions."""
+
+    def setUp(self) -> None:
+        """Patch the issue path to select nothing and the revision path to answer."""
+        super().setUp()
+        self.entries: dict[tuple[str, int], dict[str, Any]] = {}
+        patch.object(
+            repository_reads,
+            "list_repositories",
+            return_value={"alpha": repo_meta("alpha")},
+        ).start()
+        patch.object(reads, "search_open_issues", return_value=[]).start()
+        patch.object(reads, "fetch_guidance", return_value=(b"g\n", SHA_B)).start()
+        patch.object(
+            reads, "bot_identity", return_value={"login": "b[bot]", "email": "e"}
+        ).start()
+        patch.object(revision_select, "build_entry", side_effect=self.entry).start()
+        patch.object(revision_select, "scan", return_value=[]).start()
+        self.addCleanup(patch.stopall)
+
+    def entry(
+        self, org: str, repo_name: str, pull_number: int, **kwargs: Any
+    ) -> dict[str, Any]:
+        """A revision entry for a known pull request, or a Skip."""
+        found = self.entries.get((repo_name, pull_number))
+        if found is None:
+            raise revision_select.Skip("not an open pull request the bot opened")
+        return {**found, "explicit": kwargs["explicit"]}
+
+    @staticmethod
+    def revision(repo: str, pull_number: int, issue: int) -> dict[str, Any]:
+        """A minimal revision entry as ``revision_select.build_entry`` returns it."""
+        return {
+            "key": f"{repo}-{issue}",
+            "task": "revise",
+            "repository": f"org/{repo}",
+            "repo_name": repo,
+            "number": issue,
+            "title": "T",
+            "priority": None,
+            "type": "Bug",
+            "url": f"https://github.com/org/{repo}/issues/{issue}",
+            "base_sha": SHA_A,
+            "rebase_sha": SHA_B,
+            "checkout_sha": SHA_B,
+            "branch": f"code-monkey/issue-{issue}",
+            "fork_org": "lfreleng-bot-forks",
+            "fork_repository": f"lfreleng-bot-forks/{repo}",
+            "pull_request": {"number": pull_number, "head_sha": SHA_A},
+            "round": 1,
+        }
+
+    def args(self, *extra: str) -> Any:
+        """Parsed arguments for a pull-requests run."""
+        return self.args_mode("pull-requests", *extra)
+
+    def args_mode(self, mode: str, *extra: str) -> Any:
+        """Parsed arguments for a run in ``mode``."""
+        return select.build_parser().parse_args(
+            [
+                "--org",
+                "org",
+                "--output-dir",
+                "out",
+                "--mode",
+                mode,
+                "--model",
+                "m",
+                "--guidance-repository",
+                "org/.github",
+                "--fork-orgs",
+                str(FORK_ORGS_PATH),
+                *extra,
+            ]
+        )
+
+    def test_named_pull_requests_become_revision_entries(self) -> None:
+        """Each named pull request is built explicitly; a miss is a named skip."""
+        self.entries[("alpha", 41)] = self.revision("alpha", 41, 7)
+        selection, _ = select.build_selection(
+            self.args("--pull-requests", "org/alpha#41,org/alpha#99")
+        )
+        self.assertEqual([e["key"] for e in selection["issues"]], ["alpha-7"])
+        self.assertIs(selection["issues"][0]["explicit"], True)
+        self.assertEqual(
+            selection["explicit_pull_requests"], ["org/alpha#41", "org/alpha#99"]
+        )
+        (skip,) = selection["skipped_issues"]
+        self.assertEqual(skip["issue"], "org/alpha#99")
+        self.assertEqual(selection["skipped"]["revision"], 1)
+        self.assertIs(selection["revise"], True)
+
+    def test_named_pull_requests_need_pull_requests_mode(self) -> None:
+        """A round names a live pull request; a branches run cannot publish one."""
+        self.entries[("alpha", 41)] = self.revision("alpha", 41, 7)
+        with self.assertRaisesRegex(reads.SelectionError, "pull-requests mode"):
+            select.build_selection(
+                self.args_mode("branches", "--pull-requests", "org/alpha#41")
+            )
+
+    def test_pull_requests_and_repositories_exclude_each_other(self) -> None:
+        """A targeted run and a scan cannot mix."""
+        with self.assertRaises(reads.SelectionError):
+            select.build_selection(
+                self.args("--pull-requests", "org/alpha#41", "--repositories", "alpha")
+            )
+
+    def test_named_issue_with_a_bot_pull_request_is_revised(self) -> None:
+        """An issue whose earlier attempt is open becomes a round, not a skip."""
+        self.entries[("alpha", 41)] = self.revision("alpha", 41, 7)
+        patch.object(
+            repository_reads, "repository_meta", return_value=repo_meta("alpha")
+        ).start()
+        patch.object(
+            reads,
+            "issue_details",
+            return_value={
+                "state": "open",
+                "title": "T",
+                "body": "",
+                "labels": [],
+                "type": "Bug",
+                "assignees": [],
+                "priority": None,
+                "url": "u",
+                "created_at": "t",
+                "author_association": "MEMBER",
+            },
+        ).start()
+        patch.object(reads, "prior_attempt", return_value="pull_request").start()
+        patch.object(
+            revision_select, "pull_request_for_branch", return_value=41
+        ).start()
+        selection, _ = select.build_selection(self.args("--issues", "org/alpha#7"))
+        (entry,) = selection["issues"]
+        self.assertEqual(entry["task"], "revise")
+        self.assertIs(entry["explicit"], True)
+        self.assertEqual(selection["skipped"]["attempted"], 0)
+        # With revisions off the old behaviour stands.
+        selection, _ = select.build_selection(
+            self.args("--issues", "org/alpha#7", "--no-revise")
+        )
+        self.assertEqual(selection["issues"], [])
+        self.assertEqual(selection["skipped"]["attempted"], 1)
+
+    def test_named_pull_request_and_its_issue_admit_one_entry(self) -> None:
+        """The same round named twice runs once."""
+        self.entries[("alpha", 41)] = self.revision("alpha", 41, 7)
+        patch.object(
+            repository_reads, "repository_meta", return_value=repo_meta("alpha")
+        ).start()
+        patch.object(
+            reads,
+            "issue_details",
+            return_value={
+                "state": "open",
+                "title": "T",
+                "body": "",
+                "labels": [],
+                "type": "Bug",
+                "assignees": [],
+                "priority": None,
+                "url": "u",
+                "created_at": "t",
+                "author_association": "MEMBER",
+            },
+        ).start()
+        patch.object(reads, "prior_attempt", return_value="pull_request").start()
+        patch.object(
+            revision_select, "pull_request_for_branch", return_value=41
+        ).start()
+        selection, _ = select.build_selection(
+            self.args("--pull-requests", "org/alpha#41", "--issues", "org/alpha#7")
+        )
+        self.assertEqual([e["key"] for e in selection["issues"]], ["alpha-7"])
+        self.assertEqual(selection["skipped"]["duplicate"], 1)
+
+    def test_scan_revisions_follow_the_repository_scope(self) -> None:
+        """The scan passes the run's repository policy to the revision scan."""
+        with patch.object(revision_select, "scan", return_value=[]) as scan:
+            select.build_selection(self.args("--repositories", "alpha"))
+        allowed = scan.call_args.kwargs["allowed"]
+        self.assertTrue(allowed("alpha"))
+        self.assertFalse(allowed("beta"))
+
+    def test_scan_puts_revisions_first_under_the_cap(self) -> None:
+        """Revisions come before new issues and share the cap; past it nothing is read."""
+        built: list[str] = []
+
+        def builder(entry: dict[str, Any]) -> Any:
+            def build() -> dict[str, Any]:
+                built.append(entry["key"])
+                return entry
+
+            return build
+
+        patch.object(
+            revision_select,
+            "scan",
+            return_value=[
+                builder(self.revision("alpha", 41, 7)),
+                builder(self.revision("beta", 9, 2)),
+            ],
+        ).start()
+        selection, _ = select.build_selection(self.args("--max-pull-requests", "1"))
+        self.assertEqual([e["key"] for e in selection["issues"]], ["alpha-7"])
+        self.assertEqual(built, ["alpha-7"])
+        self.assertEqual(selection["skipped"]["cap"], 1)
+        selection, _ = select.build_selection(self.args("--no-revise"))
+        self.assertEqual(selection["issues"], [])
+        # Revisions publish in pull-requests mode alone; a branches run selects none.
+        with patch.object(revision_select, "scan", return_value=[]) as scan:
+            select.build_selection(self.args_mode("branches"))
+        scan.assert_not_called()
 
 
 class ParseMaxPullRequestsTest(unittest.TestCase):
@@ -166,17 +615,17 @@ class ParseMaxPullRequestsTest(unittest.TestCase):
 
     def test_zero_lifts_cap(self) -> None:
         """Zero is valid and means unbounded."""
-        self.assertEqual(select.parse_max_pull_requests("0"), 0)
+        self.assertEqual(inputs.parse_max_pull_requests("0"), 0)
 
     def test_positive(self) -> None:
         """A positive integer, with surrounding whitespace, parses."""
-        self.assertEqual(select.parse_max_pull_requests(" 10 "), 10)
+        self.assertEqual(inputs.parse_max_pull_requests(" 10 "), 10)
 
     def test_rejects_invalid(self) -> None:
         """Negatives, words and empty strings are refused."""
         for bad in ("-1", "ten", "", "1.5"):
             with self.subTest(bad=bad), self.assertRaises(reads.SelectionError):
-                select.parse_max_pull_requests(bad)
+                inputs.parse_max_pull_requests(bad)
 
 
 class LoadExclusionsTest(unittest.TestCase):
@@ -188,7 +637,7 @@ class LoadExclusionsTest(unittest.TestCase):
             file = Path(tmp) / "ex.txt"
             file.write_text("from-file\n", encoding="utf-8")
             self.assertEqual(
-                select.load_exclusions(file, "Over, ride"), ["over", "ride"]
+                inputs.load_exclusions(file, "Over, ride"), ["over", "ride"]
             )
 
     def test_file_comments_and_blanks(self) -> None:
@@ -199,20 +648,20 @@ class LoadExclusionsTest(unittest.TestCase):
                 "# heading\n\nAlpha  # trailing\n  \nbeta, Gamma\n", encoding="utf-8"
             )
             self.assertEqual(
-                select.load_exclusions(file, ""), ["alpha", "beta", "gamma"]
+                inputs.load_exclusions(file, ""), ["alpha", "beta", "gamma"]
             )
 
     def test_no_file_no_override(self) -> None:
         """Nothing configured means nothing excluded."""
-        self.assertEqual(select.load_exclusions(None, "  "), [])
+        self.assertEqual(inputs.load_exclusions(None, "  "), [])
 
     def test_non_file_raises(self) -> None:
         """A missing path or a directory is an operational failure."""
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(reads.SelectionError):
-                select.load_exclusions(Path(tmp) / "absent", "")
+                inputs.load_exclusions(Path(tmp) / "absent", "")
             with self.assertRaises(reads.SelectionError):
-                select.load_exclusions(Path(tmp), "")
+                inputs.load_exclusions(Path(tmp), "")
 
 
 class RankKeyTest(unittest.TestCase):
@@ -509,14 +958,16 @@ class ChooseTest(NoSubprocessCase):
 
     def test_matrix_limit_bounds_even_unbounded_runs(self) -> None:
         """Zero and oversized caps both stop at the Actions matrix limit."""
-        ranked = [candidate(f"r{i}", i) for i in range(1, select.MATRIX_LIMIT + 4)]
-        for requested in (0, select.MATRIX_LIMIT + 50):
+        ranked = [
+            candidate(f"r{i}", i) for i in range(1, choose_module.MATRIX_LIMIT + 4)
+        ]
+        for requested in (0, choose_module.MATRIX_LIMIT + 50):
             with self.subTest(max_pull_requests=requested):
                 skipped = fresh_skipped()
                 chosen = self.choose(
                     ranked, max_pull_requests=requested, skipped=skipped
                 )
-                self.assertEqual(len(chosen), select.MATRIX_LIMIT)
+                self.assertEqual(len(chosen), choose_module.MATRIX_LIMIT)
                 self.assertEqual(skipped["cap"], 3)
 
     def test_selection_byte_budget(self) -> None:
@@ -526,7 +977,9 @@ class ChooseTest(NoSubprocessCase):
         small = candidate("small", 2)
         ranked = [big, small, candidate("third", 3)]
         skipped = fresh_skipped()
-        with patch.object(select, "MAX_SELECTION_BYTES", 1600):
+        # The budget sits between the first entry alone and the first
+        # two together.
+        with patch.object(choose_module, "MAX_SELECTION_BYTES", 1800):
             chosen = self.choose(ranked, max_pull_requests=0, skipped=skipped)
         # The first entry fits alone; the second would push past the budget
         # and the third is refused without further reads.
@@ -720,6 +1173,11 @@ class WriteOutputsTest(unittest.TestCase):
                             "branch": "code-monkey/issue-3",
                             "fork_org": "lfreleng-bot-forks",
                             "fork_repository": "lfreleng-bot-forks/alpha",
+                            "task": "issue",
+                            "checkout_sha": SHA_A,
+                            "rebase_sha": "",
+                            "head_sha": "",
+                            "pull_number": 0,
                         }
                     ]
                 },
@@ -732,7 +1190,7 @@ class WriteOutputsTest(unittest.TestCase):
             summary = (out / "selection-summary.md").read_text(encoding="utf-8")
         self.assertIn("## Issue selection", summary)
         self.assertIn(
-            "| [alpha#3](https://github.com/org/alpha/issues/3) | High | Bug "
+            "| [alpha#3](https://github.com/org/alpha/issues/3) | issue | High | Bug "
             "| Fix a \\| thing |",
             summary,
         )
@@ -779,12 +1237,15 @@ class MainTest(NoSubprocessCase):
             "assignees": [],
             "priority": "Urgent",
         }
-        patch.object(reads, "list_repositories", return_value=repositories).start()
+        patch.object(
+            repository_reads, "list_repositories", return_value=repositories
+        ).start()
         patch.object(reads, "search_open_issues", return_value=issues).start()
         patch.object(reads, "issue_details", return_value=details).start()
         patch.object(reads, "prior_attempt", return_value=None).start()
         patch.object(reads, "has_open_linked_pr", return_value=False).start()
         patch.object(reads, "branch_head", return_value=SHA_B).start()
+        patch.object(revision_select, "scan", return_value=[]).start()
         patch.object(
             reads, "filtered_comments", return_value=([{"body": "hi"}], 2, False)
         ).start()
@@ -891,7 +1352,7 @@ class MainTest(NoSubprocessCase):
         """A ``GitHubError`` from a read takes the same failure path."""
         self.patch_reads()
         patch.object(
-            reads,
+            repository_reads,
             "list_repositories",
             side_effect=github.GitHubError("boom (HTTP 500)"),
         ).start()

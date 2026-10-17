@@ -33,7 +33,12 @@ The author job never holds a credential that can write to a
 repository. It leaves a git bundle and a manifest; the publish job
 verifies both offline against the trusted selection, then replays
 the commits through GitHub's `createCommitOnBranch`, which signs
-them, and opens the pull request. The agent reads the organisation's
+them, opens the pull request, requests a Copilot review of it and
+waits for the verdict, which the issue comment and the run report
+state. A review with findings, or a maintainer's comment, brings a
+revision round: a later session reads the findings, revises the
+same pull request in place, answers each thread, and the review
+runs again, up to ten rounds. The agent reads the organisation's
 `AGENTS.md` at a recorded commit and works to its rules.
 
 ## Where bot branches live
@@ -65,7 +70,12 @@ after the daily issues triage, and stays in dry-run until the
 rollout in the design document clears it. Organisation
 administrators can dispatch it by hand with a model, a mode
 (`select`, `branches`, `pull-requests`), issue and runtime caps,
-and a repository list.
+a category list, and either a repository list to scan or a list of
+issues to work outright (`repo#N`, `owner/repo#N` or URLs), which
+skips the scan and the triage filters. A list of the bot's open pull
+requests runs a revision round on each; an issue whose earlier
+attempt is still open gets a round too, and scheduled runs revise
+before they take new issues unless `revise` is off.
 
 ## Reusable workflow
 
